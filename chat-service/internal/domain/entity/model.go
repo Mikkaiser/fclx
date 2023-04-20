@@ -16,6 +16,6 @@ func (m *Model) GetMaxTokens() int {
 	return m.MaxTokens
 }
 
-func (m *Model) GetName() string {
+func (m *Model) GetModelName() string {
 	return m.Name
 }
