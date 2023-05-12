@@ -3,7 +3,10 @@ package chatcompletionstream
 import (
 	"context"
 	"errors"
+	"io"
+	"strings"
 
+	"github.com/Mikkaiser/fclx/chat-service/internal/domain/entity"
 	"github.com/Mikkaiser/fclx/chat-service/internal/domain/gateway"
 	openai "github.com/sashabaranov/go-openai"
 )
@@ -11,6 +14,7 @@ import (
 type ChatCompletionUseCase struct {
 	ChatGateway  gateway.ChatGateway
 	OpenAiClient *openai.Client
+	Stream       chan ChatCompletionOutputDTO
 }
 
 type ChatCompletionConfigInputDTO struct {
@@ -39,10 +43,11 @@ type ChatCompletionOutputDTO struct {
 	Content string
 }
 
-func NewChatCompletionUseCase(chatGateway gateway.ChatGateway, openAiCLient *openai.Client) *ChatCompletionUseCase {
+func NewChatCompletionUseCase(chatGateway gateway.ChatGateway, openAiCLient *openai.Client, stream chan ChatCompletionOutputDTO) *ChatCompletionUseCase {
 	return &ChatCompletionUseCase{
 		ChatGateway:  chatGateway,
 		OpenAiClient: openAiCLient,
+		Stream:       stream,
 	}
 }
 
@@ -63,6 +68,107 @@ func (uc *ChatCompletionUseCase) Execute(ctx context.Context, input ChatCompleti
 			if err != nil {
 				return nil, errors.New("Error persisting new chat: " + err.Error())
 			}
+		} else {
+			return nil, errors.New("Error fetching existing chat: " + err.Error())
 		}
 	}
+	userMessage, err := entity.NewMessage("user", input.UserMessage, chat.Config.Model)
+	if err != nil {
+		return nil, errors.New("Error creating user message: " + err.Error())
+	}
+	err = chat.AddMessage(userMessage)
+	if err != nil {
+		return nil, errors.New("Error adding new meessage to chat: " + err.Error())
+	}
+
+	messages := []openai.ChatCompletionMessage{}
+	for _, msg := range chat.Messages {
+		messages = append(messages, openai.ChatCompletionMessage{
+			Role:    msg.Role,
+			Content: msg.Content,
+		})
+	}
+
+	resp, err := uc.OpenAiClient.CreateChatCompletionStream(
+		ctx,
+		openai.ChatCompletionRequest{
+			Model:            chat.Config.Model.Name,
+			Messages:         messages,
+			MaxTokens:        chat.Config.MaxTokens,
+			Temperature:      chat.Config.Temperature,
+			TopP:             chat.Config.TopP,
+			PresencePenalty:  chat.Config.PresencePenalty,
+			FrequencyPenalty: chat.Config.FrequencyPenalty,
+			Stop:             chat.Config.Stop,
+			Stream:           true,
+		},
+	)
+	if err != nil {
+		return nil, errors.New("Error creating chat completion stream: " + err.Error())
+	}
+
+	var fullResponse strings.Builder
+
+	for {
+		response, err := resp.Recv()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return nil, errors.New("Error streaming response: " + err.Error())
+		}
+
+		fullResponse.WriteString(response.Choices[0].Delta.Content)
+		r := ChatCompletionOutputDTO{
+			ChatID:  chat.ID,
+			UserID:  input.UserID,
+			Content: fullResponse.String(),
+		}
+		uc.Stream <- r
+	}
+
+	assistant, err := entity.NewMessage("assistant", fullResponse.String(), chat.Config.Model)
+	if err != nil {
+		return nil, errors.New("Error creating assistant message: " + err.Error())
+	}
+
+	err = chat.AddMessage(assistant)
+	if err != nil {
+		return nil, errors.New("Error adding assistant message to chat: " + err.Error())
+	}
+
+	err = uc.ChatGateway.SaveChat(ctx, chat)
+	if err != nil {
+		return nil, errors.New("Error saving chat: " + err.Error())
+	}
+
+	return &ChatCompletionOutputDTO{
+		ChatID:  chat.ID,
+		UserID:  input.UserID,
+		Content: fullResponse.String(),
+	}, nil
+}
+
+func createNewChat(input ChatCompletionInputDTO) (*entity.Chat, error) {
+	model := entity.NewModel(input.Config.Model, input.Config.ModelMaxTokens)
+	chatConfig := &entity.ChatConfig{
+		Temperature:      input.Config.Temperature,
+		TopP:             input.Config.TopP,
+		N:                input.Config.N,
+		Stop:             input.Config.Stop,
+		MaxTokens:        input.Config.MaxTokens,
+		PresencePenalty:  input.Config.PresencePenalty,
+		FrequencyPenalty: input.Config.FrequencyPenalty,
+		Model:            model,
+	}
+	initialMessage, err := entity.NewMessage("system", input.Config.InitialSystemMessage, model)
+	if err != nil {
+		return nil, errors.New("Error creating initial message: " + err.Error())
+	}
+
+	chat, err := entity.NewChat(input.UserID, initialMessage, chatConfig)
+	if err != nil {
+		return nil, errors.New("Error creating new chat: " + err.Error())
+	}
+	return chat, nil
 }
